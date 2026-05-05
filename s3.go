@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -96,16 +97,18 @@ retry:
 	obj, err := s.client.GetObject(s.bucket, name, minio.GetObjectOptions{})
 	if err != nil {
 		if attempt <= s.opt.ErrorRetry {
+			fmt.Fprintf(os.Stderr, "desync debug: s3 get-object failed for chunk %s object %s attempt %d/%d: %v\n", id, name, attempt, s.opt.ErrorRetry+1, err)
 			time.Sleep(time.Duration(attempt) * s.opt.ErrorRetryBaseInterval)
 			goto retry
 		}
 		return nil, errors.Wrap(err, s.String())
 	}
-	defer obj.Close()
 
 	b, err := io.ReadAll(obj)
+	closeErr := obj.Close()
 	if err != nil {
 		if attempt <= s.opt.ErrorRetry {
+			fmt.Fprintf(os.Stderr, "desync debug: s3 read failed for chunk %s object %s attempt %d/%d: %v\n", id, name, attempt, s.opt.ErrorRetry+1, err)
 			time.Sleep(time.Duration(attempt) * s.opt.ErrorRetryBaseInterval)
 			goto retry
 		}
@@ -121,15 +124,27 @@ retry:
 		}
 		return nil, err
 	}
-	chunk, err := NewChunkFromStorage(id, b, s.converters, s.opt.SkipVerify)
-	if err != nil {
+	if closeErr != nil {
 		if attempt <= s.opt.ErrorRetry {
-			Log.Warnf("invalid chunk %s read from s3 object %s with %d bytes on attempt %d/%d: %v", id, name, len(b), attempt, s.opt.ErrorRetry+1, err)
+			fmt.Fprintf(os.Stderr, "desync debug: s3 close failed for chunk %s object %s after reading %d bytes attempt %d/%d: %v\n", id, name, len(b), attempt, s.opt.ErrorRetry+1, closeErr)
 			time.Sleep(time.Duration(attempt) * s.opt.ErrorRetryBaseInterval)
 			goto retry
 		}
+		return nil, errors.Wrap(closeErr, fmt.Sprintf("closing chunk %s after reading %d bytes from s3 store", id, len(b)))
 	}
-	return chunk, err
+	chunk, err := NewChunkFromStorage(id, b, s.converters, s.opt.SkipVerify)
+	if err != nil {
+		if attempt <= s.opt.ErrorRetry {
+			fmt.Fprintf(os.Stderr, "desync debug: invalid chunk %s from s3 object %s after reading %d bytes attempt %d/%d: %v\n", id, name, len(b), attempt, s.opt.ErrorRetry+1, err)
+			time.Sleep(time.Duration(attempt) * s.opt.ErrorRetryBaseInterval)
+			goto retry
+		}
+		return nil, errors.Wrap(err, fmt.Sprintf("invalid chunk %s from s3 object %s after reading %d bytes on final attempt %d/%d", id, name, len(b), attempt, s.opt.ErrorRetry+1))
+	}
+	if attempt > 1 {
+		fmt.Fprintf(os.Stderr, "desync debug: recovered chunk %s from s3 object %s after %d attempts, final read %d bytes\n", id, name, attempt, len(b))
+	}
+	return chunk, nil
 }
 
 // StoreChunk adds a new chunk to the store
