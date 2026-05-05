@@ -1,6 +1,8 @@
 package desync
 
-import "fmt"
+import (
+	"fmt"
+)
 
 // ChunkMissing is returned by a store that can't find a requested chunk
 type ChunkMissing struct {
@@ -22,12 +24,17 @@ func (e NoSuchObject) Error() string {
 
 // ChunkInvalid means the hash of the chunk content doesn't match its ID
 type ChunkInvalid struct {
-	ID  ChunkID
-	Sum ChunkID
+	ID    ChunkID
+	Sum   ChunkID
+	Cause error
 }
 
 func (e ChunkInvalid) Error() string {
-	return fmt.Sprintf("chunk id %s does not match its hash %s", e.ID.String(), e.Sum.String())
+	msg := fmt.Sprintf("chunk id %s does not match its hash %s", e.ID.String(), e.Sum.String())
+	if e.Cause != nil {
+		msg += fmt.Sprintf(": %s", e.Cause)
+	}
+	return msg
 }
 
 // InvalidFormat is returned when an error occurred when parsing an archive file

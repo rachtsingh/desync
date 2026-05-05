@@ -33,7 +33,10 @@ func NewChunkWithID(id ChunkID, b []byte, skipVerify bool) (*Chunk, error) {
 		c.idCalculated = true // Pretend this was calculated. No need to re-calc later
 		return c, nil
 	}
-	sum := c.ID()
+	sum, err := c.CalculatedID()
+	if err != nil {
+		return nil, ChunkInvalid{ID: id, Sum: sum, Cause: err}
+	}
 	if sum != id {
 		return nil, ChunkInvalid{ID: id, Sum: sum}
 	}
@@ -49,7 +52,10 @@ func NewChunkFromStorage(id ChunkID, b []byte, modifiers Converters, skipVerify 
 		c.idCalculated = true // Pretend this was calculated. No need to re-calc later
 		return c, nil
 	}
-	sum := c.ID()
+	sum, err := c.CalculatedID()
+	if err != nil {
+		return nil, ChunkInvalid{ID: id, Sum: sum, Cause: err}
+	}
 	if sum != id {
 		return nil, ChunkInvalid{ID: id, Sum: sum}
 	}
@@ -75,16 +81,22 @@ func (c *Chunk) Data() ([]byte, error) {
 // after the first call and doesn't need to be re-calculated. Note that calculating
 // the ID may mean decompressing the data first.
 func (c *Chunk) ID() ChunkID {
+	sum, _ := c.CalculatedID()
+	return sum
+}
+
+// CalculatedID returns the checksum of the uncompressed chunk data.
+func (c *Chunk) CalculatedID() (ChunkID, error) {
 	if c.idCalculated {
-		return c.id
+		return c.id, nil
 	}
 	b, err := c.Data()
 	if err != nil {
-		return ChunkID{}
+		return ChunkID{}, err
 	}
 	c.id = Digest.Sum(b)
 	c.idCalculated = true
-	return c.id
+	return c.id, nil
 }
 
 // Storage returns the chunk data in compressed form. If the chunk was created

@@ -121,7 +121,15 @@ retry:
 		}
 		return nil, err
 	}
-	return NewChunkFromStorage(id, b, s.converters, s.opt.SkipVerify)
+	chunk, err := NewChunkFromStorage(id, b, s.converters, s.opt.SkipVerify)
+	if err != nil {
+		if attempt <= s.opt.ErrorRetry {
+			Log.Warnf("invalid chunk %s read from s3 object %s with %d bytes on attempt %d/%d: %v", id, name, len(b), attempt, s.opt.ErrorRetry+1, err)
+			time.Sleep(time.Duration(attempt) * s.opt.ErrorRetryBaseInterval)
+			goto retry
+		}
+	}
+	return chunk, err
 }
 
 // StoreChunk adds a new chunk to the store
