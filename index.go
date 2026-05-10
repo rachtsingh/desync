@@ -8,6 +8,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -164,12 +165,18 @@ func ChunkStream(ctx context.Context, c Chunker, ws WriteStore, n int) (Index, e
 	for range n {
 		g.Go(func() error {
 			for c := range in {
+				start := time.Now()
 				// Create a chunk object, needed to calculate the checksum
 				chunk := NewChunk(c.b)
 
 				// Record the index row
 				idxChunk := IndexChunk{Start: c.start, Size: uint64(len(c.b)), ID: chunk.ID()}
 				recordResult(c.num, idxChunk)
+				if debugStatsActive() {
+					globalDebugStats.workerBuildNs.Add(debugStatsSince(start))
+					globalDebugStats.chunks.Add(1)
+					globalDebugStats.chunkBytes.Add(int64(len(c.b)))
+				}
 
 				if err := s.StoreChunk(chunk); err != nil {
 					return err
@@ -185,7 +192,12 @@ func ChunkStream(ctx context.Context, c Chunker, ws WriteStore, n int) (Index, e
 	var num int // chunk #, so we can re-assemble the index in the right order later
 loop:
 	for {
+		nextStart := time.Now()
 		start, b, err := c.Next()
+		if debugStatsActive() {
+			globalDebugStats.chunkerNextCalls.Add(1)
+			globalDebugStats.chunkerNextNs.Add(debugStatsSince(nextStart))
+		}
 		if err != nil {
 			return Index{}, err
 		}

@@ -37,6 +37,9 @@ type LocalFSOptions struct {
 
 	// Reads all timestamps as zero. Used in tar operations to avoid unnecessary changes.
 	NoTime bool
+
+	// Do not read or write extended attributes.
+	NoXattrs bool
 }
 
 var _ FilesystemWriter = &LocalFS{}

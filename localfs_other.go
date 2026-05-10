@@ -34,7 +34,7 @@ func (fs *LocalFS) SetDirPermissions(n NodeDirectory) error {
 			return err
 		}
 
-		if n.Xattrs != nil {
+		if !fs.opts.NoXattrs && n.Xattrs != nil {
 			for key, value := range n.Xattrs {
 				if err := xattr.LSet(dst, key, []byte(value)); err != nil {
 					return err
@@ -59,7 +59,7 @@ func (fs *LocalFS) SetFilePermissions(n NodeFile) error {
 			return err
 		}
 
-		if n.Xattrs != nil {
+		if !fs.opts.NoXattrs && n.Xattrs != nil {
 			for key, value := range n.Xattrs {
 				if err := xattr.LSet(dst, key, []byte(value)); err != nil {
 					return err
@@ -88,7 +88,7 @@ func (fs *LocalFS) SetSymlinkPermissions(n NodeSymlink) error {
 			return err
 		}
 
-		if n.Xattrs != nil {
+		if !fs.opts.NoXattrs && n.Xattrs != nil {
 			for key, value := range n.Xattrs {
 				if err := xattr.LSet(dst, key, []byte(value)); err != nil {
 					return err
@@ -114,7 +114,7 @@ func (fs *LocalFS) CreateDevice(n NodeDevice) error {
 			return err
 		}
 
-		if n.Xattrs != nil {
+		if !fs.opts.NoXattrs && n.Xattrs != nil {
 			for key, value := range n.Xattrs {
 				if err := xattr.LSet(dst, key, []byte(value)); err != nil {
 					return err
@@ -144,6 +144,14 @@ func mkdev(major, minor uint64) uint64 {
 // Next returns the next filesystem entry or io.EOF when done. The caller is responsible
 // for closing the returned File object.
 func (fs *LocalFS) Next() (*File, error) {
+	nextStart := time.Now()
+	if debugStatsActive() {
+		globalDebugStats.localNextCalls.Add(1)
+		defer func() {
+			globalDebugStats.localNextNs.Add(debugStatsSince(nextStart))
+		}()
+	}
+
 	fs.once.Do(func() {
 		fs.initForReading()
 	})
@@ -170,24 +178,20 @@ func (fs *LocalFS) Next() (*File, error) {
 		panic("unsupported platform")
 	}
 
-	// Extract the Xattrs if any
-	xa := make(map[string]string)
-	keys, err := xattr.LList(entry.path)
+	xa, err := fs.xattrs(entry.path)
 	if err != nil {
 		return nil, err
-	}
-	for _, key := range keys {
-		value, err := xattr.LGet(entry.path, key)
-		if err != nil {
-			return nil, err
-		}
-		xa[key] = string(value)
 	}
 
 	// If it's a file, open it and return a ReadCloser
 	var r io.ReadCloser
 	if entry.info.Mode().IsRegular() {
+		openStart := time.Now()
 		data, err := os.Open(entry.path)
+		if debugStatsActive() {
+			globalDebugStats.localOpenFile.Add(1)
+			globalDebugStats.localOpenFileNs.Add(debugStatsSince(openStart))
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -197,7 +201,12 @@ func (fs *LocalFS) Next() (*File, error) {
 	// If this is a symlink we need to get the link target
 	var linkTarget string
 	if entry.info.Mode()&os.ModeSymlink != 0 {
+		readlinkStart := time.Now()
 		linkTarget, err = os.Readlink(entry.path)
+		if debugStatsActive() {
+			globalDebugStats.localReadlink.Add(1)
+			globalDebugStats.localReadlinkNs.Add(debugStatsSince(readlinkStart))
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -226,6 +235,36 @@ func (fs *LocalFS) Next() (*File, error) {
 	return f, nil
 }
 
+func (fs *LocalFS) xattrs(file string) (map[string]string, error) {
+	if fs.opts.NoXattrs {
+		return nil, nil
+	}
+
+	xa := make(map[string]string)
+	listStart := time.Now()
+	keys, err := xattr.LList(file)
+	if debugStatsActive() {
+		globalDebugStats.localXattrList.Add(1)
+		globalDebugStats.localXattrNs.Add(debugStatsSince(listStart))
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range keys {
+		getStart := time.Now()
+		value, err := xattr.LGet(file, key)
+		if debugStatsActive() {
+			globalDebugStats.localXattrGet.Add(1)
+			globalDebugStats.localXattrNs.Add(debugStatsSince(getStart))
+		}
+		if err != nil {
+			return nil, err
+		}
+		xa[key] = string(value)
+	}
+	return xa, nil
+}
+
 func (fs *LocalFS) initForReading() {
 	if fs.opts.OneFileSystem {
 		info, err := os.Lstat(fs.Root)
@@ -250,6 +289,9 @@ func (fs *LocalFS) startSerializer() {
 				if ok && uint64(st.Dev) != fs.dev {
 					return nil
 				}
+			}
+			if debugStatsActive() {
+				globalDebugStats.localWalkEntries.Add(1)
 			}
 			fs.entries <- walkEntry{path, info, err}
 			return nil

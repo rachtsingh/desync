@@ -2,6 +2,7 @@ package desync
 
 import (
 	"sync"
+	"time"
 )
 
 // ChunkStorage stores chunks in a writable store. It can be safely used by multiple goroutines and
@@ -42,16 +43,38 @@ func (s *ChunkStorage) unmarkProcessed(id ChunkID) {
 
 // StoreChunk stores a single chunk in a synchronous manner.
 func (s *ChunkStorage) StoreChunk(chunk *Chunk) (err error) {
+	start := time.Now()
+	if debugStatsActive() {
+		globalDebugStats.chunkStorageCalls.Add(1)
+		defer func() {
+			globalDebugStats.chunkStorageNs.Add(debugStatsSince(start))
+		}()
+	}
 
 	// Mark this chunk as done so no other goroutine will attempt to store it
 	// at the same time. If this is the first time this chunk is marked, it'll
 	// return false and we need to continue processing/storing the chunk below.
 	if s.markProcessed(chunk.ID()) {
+		if debugStatsActive() {
+			globalDebugStats.chunkStorageProcessedHits.Add(1)
+		}
 		return nil
 	}
 
 	// Skip this chunk if the store already has it
-	if hasChunk, err := s.ws.HasChunk(chunk.ID()); err != nil || hasChunk {
+	hasStart := time.Now()
+	hasChunk, err := s.ws.HasChunk(chunk.ID())
+	if debugStatsActive() {
+		globalDebugStats.chunkStorageHasCalls.Add(1)
+		globalDebugStats.chunkStorageHasNs.Add(debugStatsSince(hasStart))
+		if err == nil && hasChunk {
+			globalDebugStats.chunkStorageHasHits.Add(1)
+		}
+		if err == nil && !hasChunk {
+			globalDebugStats.chunkStorageHasMisses.Add(1)
+		}
+	}
+	if err != nil || hasChunk {
 		return err
 	}
 
@@ -64,5 +87,11 @@ func (s *ChunkStorage) StoreChunk(chunk *Chunk) (err error) {
 	}()
 
 	// Store the compressed chunk
-	return s.ws.StoreChunk(chunk)
+	putStart := time.Now()
+	err = s.ws.StoreChunk(chunk)
+	if debugStatsActive() {
+		globalDebugStats.chunkStoragePutCalls.Add(1)
+		globalDebugStats.chunkStoragePutNs.Add(debugStatsSince(putStart))
+	}
+	return err
 }

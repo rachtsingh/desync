@@ -1,0 +1,16 @@
+# CLAUDE.log
+
+## 2026-05-08 18:20:02+00:00
+
+- Productionized S3 invalid remote chunk retry handling by removing diagnostic stderr output and splitting object reads from storage validation. Network/object read errors still use `StoreOptions.ErrorRetry`; storage validation/decompression failures retry with the same configured retry budget capped at two retries beyond the first read.
+- Added tests for S3 recovery after one invalid storage payload and for the two-retry validation cap while preserving `ChunkInvalid` in the error chain and clean `ChunkID.String()` formatting.
+- Added `LocalFSOptions.NoXattrs` plus `desync tar --no-xattrs`; local disk tar reads now skip `xattr.LList`/`xattr.LGet` when enabled, and LocalFS write-side xattr application also respects the option.
+- Added LocalFS/tar and CLI coverage for the no-xattrs path.
+- Targeted tests passed with `GOCACHE=/tmp/desync-go-build /usr/local/go/bin/go test ...`; full package S3 integration was not run because the pre-existing `TestS3StoreGetChunk/no_error` panics in the available MinIO/Go test environment.
+
+## 2026-05-08 18:43:00+00:00
+
+- Added opt-in desync runtime counters behind `DESYNC_DEBUG_STATS`; periodic output is controlled by `DESYNC_DEBUG_STATS_INTERVAL` and includes filesystem walking/open/xattr timing, chunker timing, worker chunk/hash bytes, chunk-store dedupe/has/put timing, and S3 stat/put/get timing.
+- Added opt-in pprof profile output with `DESYNC_CPU_PROFILE=/path/to/cpu.pprof` and `DESYNC_MEM_PROFILE=/path/to/mem.pprof`.
+- Verified the CLI/profile path with `GOCACHE=/tmp/desync-go-build DESYNC_DEBUG_STATS=1 DESYNC_DEBUG_STATS_INTERVAL=1s DESYNC_CPU_PROFILE=/tmp/desync-help.cpu.pprof DESYNC_MEM_PROFILE=/tmp/desync-help.mem.pprof /usr/local/go/bin/go run ./cmd/desync --help`.
+- Re-ran targeted checks: `GOCACHE=/tmp/desync-go-build /usr/local/go/bin/go test ./cmd/desync -run 'TestTarCommandNoXattrs$'` and `GOCACHE=/tmp/desync-go-build /usr/local/go/bin/go test -run 'TestS3StoreGetChunk(RetriesInvalidChunk|CapsInvalidChunkRetries)$'`.

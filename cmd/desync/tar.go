@@ -56,6 +56,7 @@ the input can be a tar file or a stream from STDIN with '-'.
 	flags.BoolVarP(&opt.createIndex, "index", "i", false, "create index file (caidx), not catar")
 	flags.StringVar(&opt.inFormat, "input-format", "disk", "input format, 'disk' or 'tar'")
 	flags.BoolVarP(&opt.NoTime, "no-time", "", false, "set file timestamps to zero in the archive")
+	flags.BoolVarP(&opt.NoXattrs, "no-xattrs", "", false, "don't read extended attributes from disk")
 	flags.BoolVarP(&opt.AddRoot, "tar-add-root", "", false, "pretend that all tar elements have a common root directory")
 
 	if runtime.GOOS != "windows" {

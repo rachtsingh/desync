@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -16,6 +15,8 @@ import (
 )
 
 var _ WriteStore = S3Store{}
+
+const maxS3InvalidChunkRetry = 2
 
 // S3StoreBase is the base object for all chunk and index stores with S3 backing
 type S3StoreBase struct {
@@ -91,14 +92,19 @@ func NewS3Store(location *url.URL, s3Creds *credentials.Credentials, region stri
 // GetChunk reads and returns one chunk from the store
 func (s S3Store) GetChunk(id ChunkID) (*Chunk, error) {
 	name := s.nameFromID(id)
+	return s.getChunkFromS3(id, name, func() ([]byte, error) {
+		return s.readChunkObject(id, name)
+	})
+}
+
+func (s S3Store) readChunkObject(id ChunkID, name string) ([]byte, error) {
 	var attempt int
 retry:
 	attempt++
+	start := time.Now()
 	obj, err := s.client.GetObject(s.bucket, name, minio.GetObjectOptions{})
 	if err != nil {
-		if attempt <= s.opt.ErrorRetry {
-			fmt.Fprintf(os.Stderr, "desync debug: s3 get-object failed for chunk %s object %s attempt %d/%d: %v\n", id, name, attempt, s.opt.ErrorRetry+1, err)
-			time.Sleep(time.Duration(attempt) * s.opt.ErrorRetryBaseInterval)
+		if retryS3Request(attempt, s.opt.ErrorRetry, s.opt.ErrorRetryBaseInterval) {
 			goto retry
 		}
 		return nil, errors.Wrap(err, s.String())
@@ -106,45 +112,77 @@ retry:
 
 	b, err := io.ReadAll(obj)
 	closeErr := obj.Close()
+	if debugStatsActive() {
+		globalDebugStats.s3GetCalls.Add(1)
+		globalDebugStats.s3GetBytes.Add(int64(len(b)))
+		globalDebugStats.s3GetNs.Add(debugStatsSince(start))
+	}
 	if err != nil {
-		if attempt <= s.opt.ErrorRetry {
-			fmt.Fprintf(os.Stderr, "desync debug: s3 read failed for chunk %s object %s attempt %d/%d: %v\n", id, name, attempt, s.opt.ErrorRetry+1, err)
-			time.Sleep(time.Duration(attempt) * s.opt.ErrorRetryBaseInterval)
+		var retryable bool
+		err, retryable = s.getChunkReadError(id, err)
+		if retryable && retryS3Request(attempt, s.opt.ErrorRetry, s.opt.ErrorRetryBaseInterval) {
 			goto retry
-		}
-		if e, ok := err.(minio.ErrorResponse); ok {
-			switch e.Code {
-			case "NoSuchBucket":
-				err = fmt.Errorf("bucket '%s' does not exist", s.bucket)
-			case "NoSuchKey":
-				err = ChunkMissing{ID: id}
-			default: // Without ListBucket perms in AWS, we get Permission Denied for a missing chunk, not 404
-				err = errors.Wrap(err, fmt.Sprintf("chunk %s could not be retrieved from s3 store", id))
-			}
 		}
 		return nil, err
 	}
 	if closeErr != nil {
-		if attempt <= s.opt.ErrorRetry {
-			fmt.Fprintf(os.Stderr, "desync debug: s3 close failed for chunk %s object %s after reading %d bytes attempt %d/%d: %v\n", id, name, len(b), attempt, s.opt.ErrorRetry+1, closeErr)
-			time.Sleep(time.Duration(attempt) * s.opt.ErrorRetryBaseInterval)
+		if retryS3Request(attempt, s.opt.ErrorRetry, s.opt.ErrorRetryBaseInterval) {
 			goto retry
 		}
-		return nil, errors.Wrap(closeErr, fmt.Sprintf("closing chunk %s after reading %d bytes from s3 store", id, len(b)))
+		return nil, errors.Wrapf(closeErr, "closing chunk %s after reading %d bytes from s3 store", id.String(), len(b))
+	}
+
+	return b, nil
+}
+
+func (s S3Store) getChunkFromS3(id ChunkID, name string, readObject func() ([]byte, error)) (*Chunk, error) {
+	var attempt int
+retry:
+	attempt++
+	b, err := readObject()
+	if err != nil {
+		return nil, err
 	}
 	chunk, err := NewChunkFromStorage(id, b, s.converters, s.opt.SkipVerify)
 	if err != nil {
-		if attempt <= s.opt.ErrorRetry {
-			fmt.Fprintf(os.Stderr, "desync debug: invalid chunk %s from s3 object %s after reading %d bytes attempt %d/%d: %v\n", id, name, len(b), attempt, s.opt.ErrorRetry+1, err)
-			time.Sleep(time.Duration(attempt) * s.opt.ErrorRetryBaseInterval)
+		if retryS3Request(attempt, s.invalidChunkRetryLimit(), s.opt.ErrorRetryBaseInterval) {
+			if debugStatsActive() {
+				globalDebugStats.s3InvalidRetries.Add(1)
+			}
 			goto retry
 		}
-		return nil, errors.Wrap(err, fmt.Sprintf("invalid chunk %s from s3 object %s after reading %d bytes on final attempt %d/%d", id, name, len(b), attempt, s.opt.ErrorRetry+1))
-	}
-	if attempt > 1 {
-		fmt.Fprintf(os.Stderr, "desync debug: recovered chunk %s from s3 object %s after %d attempts, final read %d bytes\n", id, name, attempt, len(b))
+		return nil, errors.Wrapf(err, "invalid chunk %s from s3 object %s after reading %d bytes", id.String(), name, len(b))
 	}
 	return chunk, nil
+}
+
+func retryS3Request(attempt, retryLimit int, baseInterval time.Duration) bool {
+	if attempt > retryLimit {
+		return false
+	}
+	time.Sleep(time.Duration(attempt) * baseInterval)
+	return true
+}
+
+func (s S3Store) invalidChunkRetryLimit() int {
+	if s.opt.ErrorRetry < maxS3InvalidChunkRetry {
+		return s.opt.ErrorRetry
+	}
+	return maxS3InvalidChunkRetry
+}
+
+func (s S3Store) getChunkReadError(id ChunkID, err error) (error, bool) {
+	var e minio.ErrorResponse
+	if errors.As(err, &e) {
+		switch e.Code {
+		case "NoSuchBucket":
+			return fmt.Errorf("bucket '%s' does not exist", s.bucket), false
+		case "NoSuchKey":
+			return ChunkMissing{ID: id}, false
+		}
+	}
+	// Without ListBucket perms in AWS, a missing chunk can be returned as Permission Denied.
+	return errors.Wrapf(err, "chunk %s could not be retrieved from s3 store", id.String()), true
 }
 
 // StoreChunk adds a new chunk to the store
@@ -158,7 +196,13 @@ func (s S3Store) StoreChunk(chunk *Chunk) error {
 	var attempt int
 retry:
 	attempt++
+	start := time.Now()
 	_, err = s.client.PutObject(s.bucket, name, bytes.NewReader(b), int64(len(b)), minio.PutObjectOptions{ContentType: contentType})
+	if debugStatsActive() {
+		globalDebugStats.s3PutCalls.Add(1)
+		globalDebugStats.s3PutBytes.Add(int64(len(b)))
+		globalDebugStats.s3PutNs.Add(debugStatsSince(start))
+	}
 	if err != nil {
 		if attempt < s.opt.ErrorRetry {
 			time.Sleep(time.Duration(attempt) * s.opt.ErrorRetryBaseInterval)
@@ -171,7 +215,17 @@ retry:
 // HasChunk returns true if the chunk is in the store
 func (s S3Store) HasChunk(id ChunkID) (bool, error) {
 	name := s.nameFromID(id)
+	start := time.Now()
 	_, err := s.client.StatObject(s.bucket, name, minio.StatObjectOptions{})
+	if debugStatsActive() {
+		globalDebugStats.s3StatCalls.Add(1)
+		globalDebugStats.s3StatNs.Add(debugStatsSince(start))
+		if err == nil {
+			globalDebugStats.s3StatHits.Add(1)
+		} else {
+			globalDebugStats.s3StatMisses.Add(1)
+		}
+	}
 	return err == nil, nil
 }
 

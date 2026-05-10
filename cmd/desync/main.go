@@ -7,8 +7,11 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/pprof"
 	"syscall"
 
+	"github.com/folbricht/desync"
 	"github.com/spf13/cobra"
 )
 
@@ -22,6 +25,15 @@ var (
 var sighup = make(chan os.Signal, 1)
 
 func main() {
+	stopCPUProfile := startCPUProfileFromEnv()
+	stopDebugStats := desync.StartDebugStatsFromEnv(stderr)
+	cleanup := func() {
+		stopDebugStats()
+		writeMemProfileFromEnv()
+		stopCPUProfile()
+	}
+	defer cleanup()
+
 	// Install a signal handler for SIGINT or SIGTERM to cancel a context in
 	// order to clean up and shut down gracefully if Ctrl+C is hit.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -67,6 +79,7 @@ func main() {
 	)
 
 	if err := rootCmd.Execute(); err != nil {
+		cleanup()
 		os.Exit(1)
 	}
 }
@@ -83,4 +96,42 @@ func printJSON(w io.Writer, v any) error {
 func die(err error) {
 	fmt.Fprintln(os.Stderr, err)
 	os.Exit(1)
+}
+
+func startCPUProfileFromEnv() func() {
+	path := os.Getenv("DESYNC_CPU_PROFILE")
+	if path == "" {
+		return func() {}
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		die(fmt.Errorf("create CPU profile %s: %w", path, err))
+	}
+	if err := pprof.StartCPUProfile(f); err != nil {
+		_ = f.Close()
+		die(fmt.Errorf("start CPU profile %s: %w", path, err))
+	}
+	return func() {
+		pprof.StopCPUProfile()
+		if err := f.Close(); err != nil {
+			fmt.Fprintf(stderr, "close CPU profile %s: %v\n", path, err)
+		}
+	}
+}
+
+func writeMemProfileFromEnv() {
+	path := os.Getenv("DESYNC_MEM_PROFILE")
+	if path == "" {
+		return
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "create memory profile %s: %v\n", path, err)
+		return
+	}
+	defer f.Close()
+	runtime.GC()
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		fmt.Fprintf(stderr, "write memory profile %s: %v\n", path, err)
+	}
 }
